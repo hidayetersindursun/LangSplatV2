@@ -9,6 +9,7 @@ dependencies:
   - plyfile=0.8.1
   - python=3.7.13
   - pip=22.3.1
+  - mkl=2021.4.0
   - pytorch=1.12.1
   - torchaudio=0.12.1
   - torchvision=0.13.1
@@ -21,6 +22,3 @@ dependencies:
   - pathlib
   - scikit-learn
   - pip:
-    - submodules/segment-anything-langsplat
-    - submodules/efficient-langsplat-rasterization
-    - submodules/simple-knn

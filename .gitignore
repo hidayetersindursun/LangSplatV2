@@ -1,3 +1,6 @@
+data/
+demo_result/
+
 output/
 eval_result/
 # Byte-compiled / optimized / DLL files
