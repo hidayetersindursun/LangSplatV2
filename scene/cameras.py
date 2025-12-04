@@ -11,6 +11,7 @@
 import os
 import pickle
 import torch
+import cv2
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
@@ -57,8 +58,20 @@ class Camera(nn.Module):
         self.camera_center = self.world_view_transform.inverse()[3, :3]
     def get_language_feature(self, language_feature_dir, feature_level):
         language_feature_name = os.path.join(language_feature_dir, self.image_name)
-        seg_map = torch.from_numpy(np.load(language_feature_name + '_s.npy'))
+        seg_map_np = np.load(language_feature_name + '_s.npy')
         feature_map = torch.from_numpy(np.load(language_feature_name + '_f.npy'))
+        
+        # Check if resizing is needed
+        if seg_map_np.shape[1] != self.image_height or seg_map_np.shape[2] != self.image_width:
+            # Resize seg_map using Nearest Neighbor to preserve integer indices
+            # seg_map_np is [Levels, H, W]. We transpose to [H, W, Levels] for cv2.resize
+            seg_map_resized = []
+            for i in range(seg_map_np.shape[0]):
+                resized_layer = cv2.resize(seg_map_np[i], (self.image_width, self.image_height), interpolation=cv2.INTER_NEAREST)
+                seg_map_resized.append(resized_layer)
+            seg_map_np = np.array(seg_map_resized)
+
+        seg_map = torch.from_numpy(seg_map_np)
         
         y, x = torch.meshgrid(torch.arange(0, self.image_height), torch.arange(0, self.image_width))
         x = x.reshape(-1, 1)

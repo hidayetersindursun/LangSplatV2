@@ -31,6 +31,31 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 import matplotlib.pyplot as plt
+import numpy as np
+from eval.openclip_encoder import OpenCLIPNetwork
+
+# Helper function for language features
+def render_language_feature_map_quick(gaussians, view, pipeline, background, args):
+    with torch.no_grad():
+        output = render(view, gaussians, pipeline, background, args)
+        language_feature_weight_map = output['language_feature_weight_map']
+        
+        D, H, W = language_feature_weight_map.shape
+        num_levels = D // 64
+        
+        # Reshape for memory efficiency
+        language_feature_weight_map = language_feature_weight_map.view(num_levels, 64, H, W).view(num_levels, 64, H*W)
+        
+        # Prepare codebooks
+        language_codebooks = gaussians._language_feature_codebooks.permute(0, 2, 1)
+        
+        # EINSUM Operation
+        language_feature_map = torch.einsum('ldk,lkn->ldn', language_codebooks, language_feature_weight_map).view(num_levels, 512, H, W)
+        
+        # Normalization
+        language_feature_map = language_feature_map / (language_feature_map.norm(dim=1, keepdim=True) + 1e-10)
+        
+    return language_feature_map
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
@@ -58,6 +83,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         codebooks = torch.stack(rvq.quantizers, dim=0).to(device)
         with torch.no_grad():
             gaussians._language_feature_codebooks.data.copy_(codebooks)
+
+    # Initialize CLIP for debug visualization
+    clip_model = None
+    text_embeds = None
+    debug_prompts = ["car", "tree", "road"]
+    if opt.include_feature:
+        print("Initializing CLIP for debug visualization...")
+        clip_model = OpenCLIPNetwork("cuda")
+        with torch.no_grad():
+            text_embeds = clip_model.encode_text(debug_prompts, "cuda")
+            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+            # Ensure dtype matches what we will render (usually float32 or float16 depending on mixed precision, but here likely float32)
+            text_embeds = text_embeds.float()
 
         
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -120,6 +158,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if args.normalize:
                 language_feature = language_feature / (language_feature.norm(dim=0, keepdim=True) + 1e-10)
             loss = 0
+            Ll1 = torch.tensor(0.0, device="cuda")
             if args.cos_loss:
                 cosloss = cos_loss(language_feature*language_feature_mask, gt_language_feature*language_feature_mask)
                 loss += cosloss
@@ -133,6 +172,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
         iter_end.record()
+        
+        if iteration % 100 == 0:
+            print(f"Iter {iteration} Loss: {loss.item()}")
+
+        # Debug Visualization
+        if opt.include_feature and args.debug_interval > 0 and iteration % args.debug_interval == 0:
+            print(f"\n[ITER {iteration}] Generating debug visualization...")
+            with torch.no_grad():
+                # Pick a random camera for debug visualization
+                debug_view = scene.getTrainCameras()[randint(0, len(scene.getTrainCameras())-1)]
+                
+                # 1. Render RGB
+                rendering = render(debug_view, gaussians, pipe, background, opt)["render"]
+                rgb_img = rendering.permute(1, 2, 0).cpu().numpy()
+                
+                # 2. Render Language Features
+                # Note: We need to temporarily set quick_render=True or handle it manually
+                # render_language_feature_map_quick handles the manual reconstruction
+                lf_map = render_language_feature_map_quick(gaussians, debug_view, pipe, background, opt)
+                
+                # Take Level 0
+                lf_map_0 = lf_map[0].permute(1, 2, 0) # [H, W, 512]
+                
+                # 3. Compute Similarity
+                sims = torch.matmul(lf_map_0, text_embeds.T) # [H, W, 3]
+                
+                # 4. Plot and Save
+                plt.figure(figsize=(15, 5))
+                
+                plt.subplot(1, 4, 1)
+                plt.title(f"RGB (Iter {iteration})")
+                plt.imshow(np.clip(rgb_img, 0, 1))
+                plt.axis('off')
+                
+                for i, prompt in enumerate(debug_prompts):
+                    sim_map = sims[..., i].cpu().numpy()
+                    
+                    plt.subplot(1, 4, i + 2)
+                    plt.title(f"Sim: {prompt}")
+                    plt.imshow(sim_map, cmap='jet')
+                    plt.colorbar()
+                    plt.axis('off')
+                
+                save_path = os.path.join(dataset.model_path, f"debug_render_{iteration:05d}.png")
+                plt.savefig(save_path)
+                plt.close()
+                print(f"Saved debug visualization to {save_path}")
+
         
         iter_record.append(iteration)
         if smooth_loss is None:
@@ -151,7 +238,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, opt))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, opt))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -178,8 +265,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(opt.include_feature), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-                if iteration == 10000:
-                    return
+
             
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -261,6 +347,7 @@ if __name__ == "__main__":
     parser.add_argument('--normalize', action='store_true', default=False)
     parser.add_argument('--accum_iter', type=int, default=1)
     parser.add_argument('--topk', type=int, default=1)
+    parser.add_argument('--debug_interval', type=int, default=0, help='Interval for saving debug visualizations (0 to disable)')
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     print(args)

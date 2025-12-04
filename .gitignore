@@ -1,13 +1,13 @@
 data/
 demo_result/
-
+custom_datasets/
 output/
 eval_result/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-
+ckpts/
 # C extensions
 *.so
 

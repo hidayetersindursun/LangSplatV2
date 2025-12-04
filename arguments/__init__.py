@@ -81,7 +81,7 @@ class OptimizationParams(ParamGroup):
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.language_feature_lr = 0.0025 # TODO: update
-        self.include_feature = True # Set to False if train the original gs
+        self.include_feature = False # Set to False if train the original gs
         self.quick_render = False
         self.vq_layer_num = 1
         self.codebook_size = 64

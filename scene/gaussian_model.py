@@ -217,10 +217,19 @@ class GaussianModel:
         if training_args.include_feature:
             if self._language_feature_logits is None or self._language_feature_logits.shape[0] != self._xyz.shape[0]:
                 # initialize language feature logits and codebooks
-                language_feature_logits = torch.zeros((self._xyz.shape[0], training_args.vq_layer_num * training_args.codebook_size), device="cuda")
+                language_feature_logits = torch.randn((self._xyz.shape[0], training_args.vq_layer_num * training_args.codebook_size), device="cuda")
                 language_feature_codebooks = torch.randn((training_args.vq_layer_num, training_args.codebook_size, 512), device="cuda")
                 self._language_feature_logits = nn.Parameter(language_feature_logits.requires_grad_(True))
                 self._language_feature_codebooks = nn.Parameter(language_feature_codebooks.requires_grad_(True))
+            else:
+                # Ensure they are parameters and require grad
+                if not isinstance(self._language_feature_logits, nn.Parameter):
+                    self._language_feature_logits = nn.Parameter(self._language_feature_logits)
+                if not isinstance(self._language_feature_codebooks, nn.Parameter):
+                    self._language_feature_codebooks = nn.Parameter(self._language_feature_codebooks)
+                
+                self._language_feature_logits.requires_grad_(True)
+                self._language_feature_codebooks.requires_grad_(True)
                 
             l = [
                 {'params': [self._language_feature_logits, self._language_feature_codebooks], 
@@ -504,6 +513,7 @@ class GaussianModel:
         weights = []
         for i in range(layer_num):
             soft_code = softmax_to_topk_soft_code(logits[:, i*codebook_size:(i+1)*codebook_size], k)
+            # soft_code = logits[:, i*codebook_size:(i+1)*codebook_size].softmax(dim=1)
             weights.append(soft_code)
         return torch.cat(weights, dim=-1).float()
     

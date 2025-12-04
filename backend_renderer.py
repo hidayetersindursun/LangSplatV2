@@ -5,7 +5,7 @@ import numpy as np
 import zmq
 import argparse
 import json
-from arguments import ModelParams, PipelineParams, get_combined_args
+from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 from gaussian_renderer import GaussianModel
 from scene import Scene
 from eval.openclip_encoder import OpenCLIPNetwork
@@ -19,20 +19,40 @@ def render_language_feature_map_quick(gaussians, view, pipeline, background, arg
         language_feature_weight_map = output['language_feature_weight_map']
         
         D, H, W = language_feature_weight_map.shape
+        num_levels = D // 64
         
         # Reshape for memory efficiency
-        language_feature_weight_map = language_feature_weight_map.view(3, 64, H, W).view(3, 64, H*W)
+        language_feature_weight_map = language_feature_weight_map.view(num_levels, 64, H, W).view(num_levels, 64, H*W)
         
         # Prepare codebooks
         language_codebooks = gaussians._language_feature_codebooks.permute(0, 2, 1)
         
         # EINSUM Operation
-        language_feature_map = torch.einsum('ldk,lkn->ldn', language_codebooks, language_feature_weight_map).view(3, 512, H, W)
+        language_feature_map = torch.einsum('ldk,lkn->ldn', language_codebooks, language_feature_weight_map).view(num_levels, 512, H, W)
         
         # Normalization
         language_feature_map = language_feature_map / (language_feature_map.norm(dim=1, keepdim=True) + 1e-10)
         
     return language_feature_map
+
+def apply_langsplat_normalization(similarity):
+    """
+    Applies the normalization logic from the original LangSplat code.
+    Maps the similarity map to highlight the top 50% of the dynamic range.
+    """
+    raw_min = similarity.min()
+    raw_max = similarity.max()
+    
+    # Min-Max Normalize [0, 1]
+    similarity = (similarity - raw_min) / (raw_max - raw_min + 1e-9)
+    
+    # Scale to [-1, 1]
+    similarity = similarity * 2 - 1
+    
+    # Clip [0, 1] (Keep only the upper half of the range)
+    similarity = np.clip(similarity, 0, 1)
+    
+    return similarity
 
 class BackendRenderer:
     def __init__(self, dataset, pipeline, args):
@@ -60,8 +80,9 @@ class BackendRenderer:
         self.dataset.model_path = self.args.ckpt_paths[0]
         self.scene = Scene(self.dataset, self.gaussians, shuffle=False)
         
-        # Load Checkpoint
-        checkpoint = os.path.join(self.args.ckpt_paths[0], f'chkpnt{self.args.checkpoint}.pth')
+        # Load Checkpoint (Level 0 is base)
+        # We know Level 0 is at 10000
+        checkpoint = os.path.join(self.args.ckpt_paths[0], 'chkpnt10000.pth')
         if not os.path.exists(checkpoint):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
             
@@ -77,7 +98,7 @@ class BackendRenderer:
         
         # Get a reference camera for intrinsics
         self.ref_cam = self.scene.getTrainCameras()[0]
-        
+
         print("✅ Models Loaded")
 
     def load_language_features(self):
@@ -88,7 +109,11 @@ class BackendRenderer:
         
         for level_idx in range(3):
             temp_gaussians = GaussianModel(self.dataset.sh_degree)
-            ckpt_path = os.path.join(self.args.ckpt_paths[level_idx], f'chkpnt{self.args.checkpoint}.pth')
+            # Determine checkpoint iteration based on level
+            # In the new pipeline, all levels are trained for 10k iterations starting from base RGB
+            iter_num = 10000
+
+            ckpt_path = os.path.join(self.args.ckpt_paths[level_idx], f'chkpnt{iter_num}.pth')
             (params, _) = torch.load(ckpt_path)
             temp_gaussians.restore(params, self.args, mode='test')
             
@@ -169,17 +194,38 @@ class BackendRenderer:
                     lf_map = render_language_feature_map_quick(self.gaussians, view_cam, self.pipeline, self.background, self.args)
                     lf_map = lf_map.permute(0, 2, 3, 1)
                     
-                    valid_map = self.clip_model.get_max_across_quick(lf_map)
-                    similarity = valid_map.mean(dim=0)[0].cpu().numpy()
+                    # Direct Similarity Calculation (Original LangSplat Logic)
+                    # We only compare the query against the scene features directly.
+                    
+                    # Encode ONLY the current prompt
+                    text_embeds = self.clip_model.encode_text([self.current_prompt], self.device)
+                    text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+                    
+                    # lf_map is [3, H, W, 512] -> Sum all levels
+                    lf_map_mean = lf_map.sum(dim=0) # [H, W, 512]
+                    lf_map_mean = lf_map_mean / (lf_map_mean.norm(dim=-1, keepdim=True) + 1e-10)
+                    text_embeds = text_embeds.to(lf_map_mean.dtype)
+                    
+                    # Compute similarity: [H, W, 512] @ [512, 1] -> [H, W, 1]
+                    sim = torch.matmul(lf_map_mean, text_embeds.T).squeeze(-1)
+                    
+                    # Result is the raw cosine similarity map
+                    similarity = sim.detach().cpu().numpy()
                     
                     raw_min = similarity.min()
                     raw_max = similarity.max()
+                    range_val = raw_max - raw_min
+                    print(f"📊 Similarity Stats - Min: {raw_min:.4f}, Max: {raw_max:.4f}, Mean: {similarity.mean():.4f}, Range: {range_val:.4f} | Threshold: {threshold}")
                     
+                    # Hard confidence check removed for raw cosine similarity
                     if raw_max < threshold:
                         similarity[:] = 0
+                    elif range_val < 0.02:
+                        print("⚠️ Range too small, suppressing heatmap.")
+                        similarity[:] = 0
                     else:
-                        similarity = (similarity - raw_min) / (raw_max - raw_min + 1e-8)
-                        similarity = similarity ** 4
+                        # Apply Original LangSplat Normalization
+                        similarity = apply_langsplat_normalization(similarity)
                     
                     heatmap = cv2.applyColorMap((similarity * 255).astype(np.uint8), cv2.COLORMAP_JET)
                     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
@@ -203,11 +249,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
+    op = OptimizationParams(parser)
     
-    parser.add_argument("--dataset_name", type=str, required=True)
+    parser.add_argument("--dataset_name", type=str, default="")
     parser.add_argument("--ckpt_root_path", default='output', type=str)
     parser.add_argument("--checkpoint", type=int, default=10000)
     parser.add_argument("--zmq_port", type=int, default=5555)
+    parser.add_argument("--custom_model_path", type=str, default="", help="Path to the trained model output directory")
     
     args = get_combined_args(parser)
     
@@ -226,12 +274,24 @@ if __name__ == "__main__":
     args.debug = False
     
     # Paths
-    args.dataset_path = f"./data/lerf_ovs/{args.dataset_name}"
-    args.source_path = args.dataset_path
-    args.ckpt_paths = [
-        os.path.join(args.ckpt_root_path, f"{args.dataset_name}_0_{level}") 
-        for level in [1, 2, 3]
-    ]
+    if not hasattr(args, 'source_path') or args.source_path == "" or args.source_path is None:
+        args.dataset_path = f"./data/lerf_ovs/{args.dataset_name}"
+        args.source_path = args.dataset_path
+    else:
+        args.dataset_path = args.source_path
+
+    if args.custom_model_path:
+        # If custom model path is provided, use it for all levels (assuming single level training or compatible)
+        args.ckpt_paths = [args.custom_model_path] * 3
+    else:
+        # Default LangSplat structure for our project
+        # Assuming dataset_name is 'araba' and output base is 'araba_final'
+        base_name = f"{args.dataset_name}_final"
+        args.ckpt_paths = [
+            os.path.join(args.ckpt_root_path, f"{base_name}_{level}_{level}") 
+            for level in [0, 1, 2]
+        ]
+        print(f"📂 Checkpoint Paths: {args.ckpt_paths}")
     
     renderer = BackendRenderer(model.extract(args), pipeline.extract(args), args)
     renderer.run()
