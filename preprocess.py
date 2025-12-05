@@ -1,6 +1,7 @@
 import os
 import random
 import argparse
+import gc
 
 import numpy as np
 import torch
@@ -121,6 +122,10 @@ def create(image_list, data_list, save_folder):
     mask_generator.predictor.model.to('cuda')
 
     for i, img in tqdm(enumerate(image_list), desc="Embedding images", leave=False):
+        save_path = os.path.join(save_folder, data_list[i].split('.')[0])
+        if os.path.exists(save_path + '_s.npy') and os.path.exists(save_path + '_f.npy'):
+            continue
+
         timer += 1
         try:
             img_embed, seg_map = _embed_clip_sam_tiles(img.unsqueeze(0), sam_encoder)
@@ -156,16 +161,15 @@ def create(image_list, data_list, save_folder):
         seg_map = torch.stack(seg_map_tensor, dim=0)
         seg_maps[i] = seg_map
 
-    mask_generator.predictor.model.to('cpu')
-        
-    for i in range(img_embeds.shape[0]):
-        save_path = os.path.join(save_folder, data_list[i].split('.')[0])
-        assert total_lengths[i] == int(seg_maps[i].max() + 1)
+        # Save immediately
+        assert total_length == int(seg_map.max() + 1)
         curr = {
-            'feature': img_embeds[i, :total_lengths[i]],
-            'seg_maps': seg_maps[i]
+            'feature': img_embeds[i, :total_length],
+            'seg_maps': seg_map
         }
         sava_numpy(save_path, curr)
+
+    mask_generator.predictor.model.to('cpu')
 
 def sava_numpy(save_path, data):
     save_path_s = save_path + '_s.npy'
@@ -307,7 +311,10 @@ def sam_encoder(image):
         for i in range(len(masks)):
             mask = masks[i]
             seg_img = get_seg_img(mask, image)
-            pad_seg_img = cv2.resize(pad_img(seg_img), (224,224))
+            if seg_img.size == 0:
+                pad_seg_img = np.zeros((224, 224, 3), dtype=np.uint8)
+            else:
+                pad_seg_img = cv2.resize(pad_img(seg_img), (224,224))
             seg_img_list.append(pad_seg_img)
 
             seg_map[masks[i]['segmentation']] = i
@@ -349,6 +356,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_path', type=str, required=True)
     parser.add_argument('--resolution', type=int, default=-1)
     parser.add_argument('--sam_ckpt_path', type=str, default="ckpts/sam_vit_h_4b8939.pth")
+    parser.add_argument('--model_type', type=str, default="vit_h")
     args = parser.parse_args()
     torch.set_default_dtype(torch.float32)
 
@@ -359,10 +367,10 @@ if __name__ == '__main__':
     data_list.sort()
 
     model = OpenCLIPNetwork(OpenCLIPNetworkConfig)
-    sam = sam_model_registry["vit_h"](checkpoint=sam_ckpt_path).to('cuda')
+    sam = sam_model_registry[args.model_type](checkpoint=sam_ckpt_path).to('cuda')
     mask_generator = SamAutomaticMaskGenerator(
         model=sam,
-        points_per_side=32,
+        points_per_side=12,
         pred_iou_thresh=0.7,
         box_nms_thresh=0.7,
         stability_score_thresh=0.85,
