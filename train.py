@@ -85,14 +85,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians._language_feature_codebooks.data.copy_(codebooks)
 
     # --- BİZİM EKLEME: Sabit Projeksiyon Matrisi (DÖNGÜ DIŞINDA) ---
-    # Bunu döngü dışında yapıyoruz ki eğitim boyunca hedef renkler değişmesin.
-    num_objects = 64
-    torch.manual_seed(42) # Sabit seed
-    # (64, 3) boyutunda rastgele renk matrisi
-    global_projection_matrix = torch.randn((num_objects, 3), device="cuda")
-    # Renk değerlerinin çok uçuk olmaması için normalize edebiliriz (Opsiyonel ama iyi olur)
-    global_projection_matrix = global_projection_matrix / global_projection_matrix.max().abs()
-    # ---------------------------------------------------------------
 
     # Initialize CLIP for debug visualization
     clip_model = None
@@ -176,36 +168,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 Ll1 = l1_loss(language_feature*language_feature_mask, gt_language_feature*language_feature_mask)   
                 loss += Ll1
 
+            # --- RGB EĞİTİMİ + BİZİM YENİ LOSS (VRAM DOSTU VERSİYON) ---
         else:
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
-            # Ana RGB Loss
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-            
-            # --- BİZİM YENİ LOSS (GÜNCELLENMİŞ HALİ) ---
-            # Sadece maske varsa çalışsın
-            # lambda_sem değerini argümanlardan çekebilirsin veya buraya elle yazabilirsin
+        
+            # Parametreleri al
             lambda_sem = getattr(opt, "lambda_sem", 0.1) 
             lambda_scale = getattr(opt, "lambda_scale", 0.05) 
 
             if lambda_sem > 0 and hasattr(viewpoint_cam, "gt_mask") and viewpoint_cam.gt_mask is not None:
-
-                # 1. Gaussian Instance Özelliklerini Proje Et
+                
                 if hasattr(gaussians, "_instance_features"):
-                    # (N, 64) @ (64, 3) -> (N, 3)
-                    raw_projected = gaussians._instance_features @ global_projection_matrix
+                    # 1. DİREKT RENDER (Matris çarpımı YOK)
+                    # Özellikleri 0-1 arasına sıkıştır (Renk uzayı için Sigmoid şart)
+                    # Gaussian'lar (-sonsuz, +sonsuz) değer alabilir, biz renge çeviriyoruz.
+                    instance_features_color = torch.sigmoid(gaussians._instance_features)
                     
-                    # [ÖNEMLİ] Değerleri 0-1 arasına sıkıştır (Renk gibi olsun)
-                    projected_features = torch.sigmoid(raw_projected)
+                    # override_color doğrudan bu 3 kanallı tensörü alır
+                    instance_render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt, override_color=instance_features_color)
+                    pred_instance_map = instance_render_pkg["render"] # Çıktı: [3, H, W]
                     
-                    # 2. Bu özellikleri Render Et (3 Kanal)
-                    instance_render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt, override_color=projected_features)
-                    pred_instance_map = instance_render_pkg["render"] # [3, H, W]
-                    
-                    # 3. GT Maskeyi Hazırla
+                    # 2. GT Maskeyi Hazırla
                     gt_mask = viewpoint_cam.gt_mask.long()
                     
-                    # Boyut kontrolü ve düzeltme
+                    # Boyut eşitleme
                     if gt_mask.shape != pred_instance_map.shape[1:]:
                          gt_mask = torch.nn.functional.interpolate(
                             gt_mask.unsqueeze(0).unsqueeze(0).float(), 
@@ -213,44 +201,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             mode="nearest"
                         ).long().squeeze()
 
-                    # --- KRİTİK EKLENTİ: VALID MASK ---
-                    # ID'si 0 olan (Siyah/Arka plan/Bilinmeyen) yerleri yoksay
+                    # 3. Valid Mask (Bilinmeyeni Yoksay)
                     valid_pixels = (gt_mask > 0)
 
                     if valid_pixels.sum() > 0:
-                        # 4. VRAM DOSTU YÖNTEM: Embedding Lookup
-                        # GT ID'leri kullanarak matristen hedef vektörleri çek
-                        # ID'leri clamp'le ki matris dışına taşmasın (Güvenlik)
-                        gt_mask_safe = torch.clamp(gt_mask, 0, num_objects - 1)
+                        # 4. GT ID -> HEDEF RENK DÖNÜŞÜMÜ (Hashing)
+                        # Her ID'yi benzersiz bir renge çeviriyoruz.
+                        # Bu sayılar rastgele asal sayılardır, çakışmayı önler.
+                        # (Kullanıcı uyarısı: Parantezler önemli)
+                        r = ((gt_mask * 153245) % 255) / 255.0
+                        g = ((gt_mask * 654321) % 255) / 255.0
+                        b = ((gt_mask * 987654) % 255) / 255.0
                         
-                        raw_gt_map = global_projection_matrix[gt_mask_safe].permute(2, 0, 1) # [3, H, W]
-                        # GT için de sigmoid uyguluyoruz ki uzaylar eşleşsin
-                        # (Not: Matrisi başta normalize ettiysen sigmoid şart değil ama zarar da vermez)
-                        gt_target_map = torch.sigmoid(raw_gt_map)
+                        gt_color_map = torch.stack([r, g, b], dim=0).float() # [3, H, W]
 
-                        # 5. Semantic Loss (Sadece Valid Piksellerde)
-                        # Maskeleme: [3, H, W] boyutuna genişlet
+                        # 5. Loss Hesabı (Sadece geçerli piksellerde)
                         valid_mask_3ch = valid_pixels.unsqueeze(0).repeat(3, 1, 1)
                         
                         masked_pred = pred_instance_map[valid_mask_3ch]
-                        masked_gt = gt_target_map[valid_mask_3ch]
+                        masked_gt = gt_color_map[valid_mask_3ch]
                         
+                        # L1 Loss (Renk Farkı = Kimlik Farkı)
                         semantic_loss = l1_loss(masked_pred, masked_gt)
                         
-                        # 6. Scale-Aware Regularization (Sadece görünür ve valid alanlardaki büyük Gaussianlar)
+                        # 6. Scale-Aware Penalty
                         radii = instance_render_pkg["radii"]
                         visibility_filter = instance_render_pkg["visibility_filter"]
                         visible_radii = radii[visibility_filter]
                         
                         scale_penalty = 0.0
                         if visible_radii.numel() > 0:
-                            # 2 pikselden büyük olanları cezalandır
-                            scale_penalty = torch.mean(torch.relu(visible_radii - 2.0))
+                            scale_penalty = torch.mean(torch.relu(visible_radii - 0.5))
                         
-                        # 7. Final Loss
                         final_sem_loss = semantic_loss + (semantic_loss * scale_penalty * lambda_scale)
-                        
-                        # Ana Loss'a ekle
                         loss += lambda_sem * final_sem_loss
                         
                         # Log
@@ -425,9 +408,9 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[2000, 4000, 6000, 8000, 10_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[2000, 4000, 6000, 8000, 10_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[2000, 4000, 6000, 8000, 10_000, 30_000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument('--cos_loss', action='store_true', default=False)
     parser.add_argument('--l1_loss', action='store_true', default=False)

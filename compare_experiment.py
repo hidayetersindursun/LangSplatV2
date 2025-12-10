@@ -101,7 +101,7 @@ def compare(args):
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     
     # Random Projection Matrisi (Train.py ile aynı seed)
-    num_objects = 64
+    num_objects = 256
     torch.manual_seed(42)
     proj_matrix = torch.randn((num_objects, 3), device="cuda")
     proj_matrix = proj_matrix / (proj_matrix.norm(dim=1, keepdim=True) + 1e-8)
@@ -126,6 +126,14 @@ def compare(args):
     out_dir = "comparison_results"
     os.makedirs(out_dir, exist_ok=True)
 
+    # Rastgele 5 kare seçimi için indeksleri belirle
+    import random
+    num_cameras = len(test_cameras)
+    if num_cameras > 5:
+        random_indices_for_visualization = set(random.sample(range(num_cameras), 5))
+    else:
+        random_indices_for_visualization = set(range(num_cameras))
+
     # Sadece ilk 5 kareyi görselleştir, hepsinin metriğini hesapla
     for idx, view in enumerate(tqdm(test_cameras)):
         
@@ -146,25 +154,17 @@ def compare(args):
             # Buraya detaylı mIoU eklenebilir, şimdilik görsel yeterli
             pass
 
-            # Rastgele 5 kare seçimi için indeksleri belirle
-    import random
-    num_cameras = len(test_cameras)
-    if num_cameras > 5:
-        random_indices_for_visualization = set(random.sample(range(num_cameras), 5))
-    else:
-        random_indices_for_visualization = set(range(num_cameras))
+        # --- GÖRSEL KAYDETME (Sadece rastgele seçilen 5 kare) ---
+        if idx in random_indices_for_visualization:
+            # Tensor -> Numpy Image
+            def to_img(tensor):
+                return (np.clip(tensor.detach().cpu().permute(1, 2, 0).numpy(), 0, 1) * 255).astype(np.uint8)
 
-    # --- GÖRSEL KAYDETME (Sadece rastgele seçilen 5 kare) ---
-    if idx in random_indices_for_visualization:
-        # Tensor -> Numpy Image
-        def to_img(tensor):
-            return (np.clip(tensor.detach().cpu().permute(1, 2, 0).numpy(), 0, 1) * 255).astype(np.uint8)
-
-        img_b_rgb = to_img(rgb_b)
-        img_o_rgb = to_img(rgb_o)
-        img_b_sem = to_img(sem_b)
-        img_o_sem = to_img(sem_o)
-            
+            img_b_rgb = to_img(rgb_b)
+            img_o_rgb = to_img(rgb_o)
+            img_b_sem = to_img(sem_b)
+            img_o_sem = to_img(sem_o)
+                
             # Ground Truth Maskeyi de renklendir
             if hasattr(view, "gt_mask") and view.gt_mask is not None:
                 gt_mask_np = view.gt_mask.cpu().numpy().astype(int)
@@ -172,7 +172,7 @@ def compare(args):
                 gt_vis = id_to_random_color(gt_mask_np)
                 # Resize (Eğer gerekirse)
                 if gt_vis.shape[:2] != img_b_rgb.shape[:2]:
-                     gt_vis = cv2.resize(gt_vis, (img_b_rgb.shape[1], img_b_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+                        gt_vis = cv2.resize(gt_vis, (img_b_rgb.shape[1], img_b_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
             else:
                 gt_vis = np.zeros_like(img_b_rgb)
 

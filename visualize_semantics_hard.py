@@ -20,7 +20,7 @@ def visualize(dataset_args, pipeline_args, full_args):
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     
     # Projeksiyon Matrisi (Aynı seed ile)
-    num_objects = 64
+    num_objects = 256
     torch.manual_seed(42)
     global_projection_matrix = torch.randn((num_objects, 3), device="cuda")
     global_projection_matrix = global_projection_matrix / (global_projection_matrix.norm(dim=1, keepdim=True) + 1e-8)

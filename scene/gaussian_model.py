@@ -138,8 +138,8 @@ class GaussianModel:
             self.spatial_lr_scale) = model_args
             
             # Init missing instance features
-            num_objects = 64
-            self._instance_features = nn.Parameter(torch.randn((self._xyz.shape[0], num_objects), device="cuda").requires_grad_(True))
+            instance_dim = 3 # RGB ID (Compressed Identity)
+            self._instance_features = nn.Parameter(torch.rand((self._xyz.shape[0], instance_dim), device="cuda").requires_grad_(True))
 
         elif len(model_args) == 13: # My RGB (RGB + Instance)
             (self.active_sh_degree, 
@@ -174,8 +174,8 @@ class GaussianModel:
             self.spatial_lr_scale) = model_args
             
             # Init missing instance features
-            num_objects = 64
-            self._instance_features = nn.Parameter(torch.randn((self._xyz.shape[0], num_objects), device="cuda").requires_grad_(True))
+            instance_dim = 3 # RGB ID
+            self._instance_features = nn.Parameter(torch.rand((self._xyz.shape[0], instance_dim), device="cuda").requires_grad_(True))
 
             if not training_args.include_feature:
                 self.optimizer.load_state_dict(opt_dict)
@@ -261,8 +261,9 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         
         # --- Instance Features Initialization ---
-        num_objects = 64 
-        fused_instance_features = torch.randn((fused_point_cloud.shape[0], num_objects), dtype=torch.float, device="cuda")
+        instance_dim = 3 # RGB ID (Color Space)
+        # Use simple random initialization (0-1) for color-like features
+        fused_instance_features = torch.rand((fused_point_cloud.shape[0], instance_dim), dtype=torch.float, device="cuda")
         self._instance_features = nn.Parameter(fused_instance_features.requires_grad_(True))
         # ----------------------------------------
 
@@ -310,7 +311,7 @@ class GaussianModel:
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-                {'params': [self._instance_features], 'lr': 0.01, "name": "instance_features"},
+                {'params': [self._instance_features], 'lr': 0.05, "name": "instance_features"},
             ]
             assert self._language_feature_logits is None and self._language_feature_codebooks is None
 
