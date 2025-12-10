@@ -55,6 +55,7 @@ class GaussianModel:
         self._language_feature_codebooks = None
         self._language_feature_weights = None
         self._language_feature_indices = None
+        self._instance_features = torch.empty(0)
         
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -83,6 +84,7 @@ class GaussianModel:
                 self.denom,
                 self.optimizer.state_dict(),
                 self.spatial_lr_scale,
+                self._instance_features,
             )
         else:
             return (
@@ -98,10 +100,28 @@ class GaussianModel:
                 self.denom,
                 self.optimizer.state_dict(),
                 self.spatial_lr_scale,
+                self._instance_features,
             )            
     
     def restore(self, model_args, training_args, mode='train'):
-        if len(model_args) == 14: # for language feature
+        if len(model_args) == 15: # My LangSplat (RGB + Lang + Instance)
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self._language_feature_logits,
+            self._language_feature_codebooks,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale,
+            self._instance_features) = model_args
+            
+        elif len(model_args) == 14: # Vanilla LangSplat (RGB + Lang)
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -116,7 +136,30 @@ class GaussianModel:
             denom,
             opt_dict, 
             self.spatial_lr_scale) = model_args
-        elif len(model_args) == 12:
+            
+            # Init missing instance features
+            num_objects = 64
+            self._instance_features = nn.Parameter(torch.randn((self._xyz.shape[0], num_objects), device="cuda").requires_grad_(True))
+
+        elif len(model_args) == 13: # My RGB (RGB + Instance)
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            opt_dict, 
+            self.spatial_lr_scale,
+            self._instance_features) = model_args
+            
+            if not training_args.include_feature:
+                self.optimizer.load_state_dict(opt_dict)
+
+        elif len(model_args) == 12: # Vanilla RGB (RGB only)
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -129,8 +172,15 @@ class GaussianModel:
             denom,
             opt_dict, 
             self.spatial_lr_scale) = model_args
+            
+            # Init missing instance features
+            num_objects = 64
+            self._instance_features = nn.Parameter(torch.randn((self._xyz.shape[0], num_objects), device="cuda").requires_grad_(True))
+
             if not training_args.include_feature:
                 self.optimizer.load_state_dict(opt_dict)
+        else:
+            raise ValueError(f"Checkpoint contains {len(model_args)} elements, which is not supported (expected 12, 13, 14, or 15).")
         
         if mode == 'train':
             self.training_setup(training_args)
@@ -159,6 +209,10 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+
+    @property
+    def get_instance_features(self):
+        return self._instance_features
     
     @property
     def get_language_feature_logits(self):
@@ -205,6 +259,13 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        
+        # --- Instance Features Initialization ---
+        num_objects = 64 
+        fused_instance_features = torch.randn((fused_point_cloud.shape[0], num_objects), dtype=torch.float, device="cuda")
+        self._instance_features = nn.Parameter(fused_instance_features.requires_grad_(True))
+        # ----------------------------------------
+
         # self._language_feature = nn.Parameter(language_feature.requires_grad_(True))
         # 在从pointcloud初始化的时候是再训练原始gs的时候，这个时候不需要进行feature的初始化
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
@@ -249,6 +310,7 @@ class GaussianModel:
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+                {'params': [self._instance_features], 'lr': 0.01, "name": "instance_features"},
             ]
             assert self._language_feature_logits is None and self._language_feature_codebooks is None
 
@@ -279,6 +341,8 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        for i in range(self._instance_features.shape[1]):
+            l.append('inst_feat_{}'.format(i))
         return l
 
     def save_ply(self, path):
@@ -293,9 +357,11 @@ class GaussianModel:
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+        
+        inst_feat = self._instance_features.detach().cpu().numpy()
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, inst_feat), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -339,6 +405,12 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
+        inst_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("inst_feat_")]
+        inst_names = sorted(inst_names, key = lambda x: int(x.split('_')[-1]))
+        inst_feats = np.zeros((xyz.shape[0], len(inst_names)))
+        for idx, attr_name in enumerate(inst_names):
+            inst_feats[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         print(self._xyz.shape[0])
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
@@ -346,6 +418,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._instance_features = nn.Parameter(torch.tensor(inst_feats, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -393,6 +466,7 @@ class GaussianModel:
         # self._language_feature = optimizable_tensors["language_feature"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._instance_features = optimizable_tensors["instance_features"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -421,14 +495,15 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_instance_features):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         # "language_feature": new_language_feature,
         "scaling" : new_scaling,
-        "rotation" : new_rotation}
+        "rotation" : new_rotation,
+        "instance_features": new_instance_features}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         
@@ -440,6 +515,7 @@ class GaussianModel:
         # self._language_feature = optimizable_tensors["language_feature"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._instance_features = optimizable_tensors["instance_features"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -465,8 +541,9 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         # new_language_feature = self._language_feature[selected_pts_mask].repeat(N,1)
+        new_instance_features = self._instance_features[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_instance_features)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -484,8 +561,9 @@ class GaussianModel:
         # new_language_feature = self._language_feature[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        new_instance_features = self._instance_features[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_instance_features)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom

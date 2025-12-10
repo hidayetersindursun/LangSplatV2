@@ -11,6 +11,8 @@
 
 import os
 import sys
+import cv2
+import torch
 from PIL import Image
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -34,6 +36,7 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    gt_mask: object
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -111,8 +114,27 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_name = os.path.basename(image_path).split(".")[0]
 
         image = Image.open(image_path)
-     
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, image_path=image_path, image_name=image_name, width=width, height=height)
+        
+        # --- SAM 2 Mask Loading ---
+        mask_folder_name = "masks_sam2"
+        mask_path = image_path.replace("images", mask_folder_name).replace(".jpg", ".png").replace(".JPG", ".png")
+        
+        gt_mask = None
+        if os.path.exists(mask_path):
+            mask_cv = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+            if mask_cv is not None:
+                if mask_cv.shape[:2] != image.size[::-1]:
+                    mask_cv = cv2.resize(
+                        mask_cv, 
+                        (image.size[0], image.size[1]), 
+                        interpolation=cv2.INTER_NEAREST 
+                    )
+                gt_mask = torch.from_numpy(mask_cv.astype(np.int32)).long()
+        else:
+             # print(f"Warning: Mask not found {mask_path}")
+             pass
+
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, image_path=image_path, image_name=image_name, width=width, height=height, gt_mask=gt_mask)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -234,7 +256,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,  
                               image_path=image_path, 
-                              image_name=image_name, width=image.size[0], height=image.size[1]))
+                              image_name=image_name, width=image.size[0], height=image.size[1], gt_mask=None))
             
     return cam_infos
 

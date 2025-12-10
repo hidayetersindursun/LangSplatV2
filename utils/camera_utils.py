@@ -8,7 +8,7 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import torch
 from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
@@ -47,10 +47,26 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
+    # --- SAM 2 Mask Resizing ---
+    gt_mask = cam_info.gt_mask
+    if gt_mask is not None:
+        # gt_mask is [H, W] tensor. Convert to numpy for cv2.resize
+        mask_np = gt_mask.numpy().astype(np.uint16) # Use uint16 to be safe for IDs > 255
+        
+        # Resize if needed
+        if mask_np.shape[:2] != resolution[::-1]: # resolution is (W, H)
+             import cv2
+             mask_np = cv2.resize(
+                mask_np, 
+                resolution, 
+                interpolation=cv2.INTER_NEAREST 
+            )
+        gt_mask = torch.from_numpy(mask_np.astype(np.int32)).long()
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, gt_mask=gt_mask)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
