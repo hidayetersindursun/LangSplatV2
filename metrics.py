@@ -151,7 +151,7 @@ def evaluate(dataset_args, pipeline_args, full_args):
         pred_ids = torch.argmin(dists, dim=1).reshape(H, W)
         
         # --- METRİK ---
-        gt_mask = view.gt_mask.long()
+        gt_mask = view.gt_mask.long().cuda()
         if gt_mask.shape != pred_ids.shape:
              gt_mask = F.interpolate(gt_mask.unsqueeze(0).unsqueeze(0).float(), size=pred_ids.shape, mode="nearest").long().squeeze()
         

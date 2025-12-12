@@ -96,6 +96,7 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         self.lambda_sem = 1.0
         self.lambda_scale = 0.1
+        self.lambda_lpips = 0.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

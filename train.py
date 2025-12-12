@@ -8,8 +8,9 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
-
+import lpips
 import os
+import cv2
 import torch
 import torch.nn as nn
 from random import randint
@@ -90,6 +91,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     clip_model = None
     text_embeds = None
     debug_prompts = ["car", "tree", "road"]
+
+    # --- LPIPS MODEL YÜKLEME ---
+    if opt.lambda_lpips > 0:
+        print(f"Initializing LPIPS model with lambda={opt.lambda_lpips}...")
+        lpips_loss_fn = lpips.LPIPS(net='vgg').cuda()
+        for param in lpips_loss_fn.parameters():
+            param.requires_grad = False
+    # ---------------------------
+
     if opt.include_feature:
         print("Initializing CLIP for debug visualization...")
         clip_model = OpenCLIPNetwork("cuda")
@@ -170,75 +180,147 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # --- RGB EĞİTİMİ + BİZİM YENİ LOSS (VRAM DOSTU VERSİYON) ---
         else:
+            # -------------------------------------------------------------------
+            # STANDART RGB EĞİTİMİ
+            # -------------------------------------------------------------------
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        
-            # Parametreleri al
+            
+            # 1. RGB LOSS (L1 + SSIM)
+            rgb_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            
+            # 2. [YENİ] LPIPS LOSS
+            # Görüntüleri -1 ile 1 arasına normalize et
+            if opt.lambda_lpips > 0:
+                lpips_val = lpips_loss_fn((image - 0.5) * 2, (gt_image - 0.5) * 2).mean()
+                loss = rgb_loss + (opt.lambda_lpips * lpips_val)
+            else:
+                loss = rgb_loss
+            
+            # -------------------------------------------------------------------
+            # [YENİ] SEMANTIC CONSISTENCY & GEOMETRIC REGULARIZATION
+            # Yöntem: Contrastive Learning (Komşuluk İlişkisi)
+            # -------------------------------------------------------------------
+            
+            # Parametreleri al (Argüman yoksa varsayılanları kullan)
             lambda_sem = getattr(opt, "lambda_sem", 0.1) 
             lambda_scale = getattr(opt, "lambda_scale", 0.05) 
+            contrastive_margin = 0.5  # Farklı nesneler feature uzayında en az bu kadar uzak olmalı
 
+            # Sadece maske varsa ve semantik eğitim açıksa çalış
             if lambda_sem > 0 and hasattr(viewpoint_cam, "gt_mask") and viewpoint_cam.gt_mask is not None:
                 
+                # Modelde instance özelliği tanımlı mı?
                 if hasattr(gaussians, "_instance_features"):
-                    # 1. DİREKT RENDER (Matris çarpımı YOK)
-                    # Özellikleri 0-1 arasına sıkıştır (Renk uzayı için Sigmoid şart)
-                    # Gaussian'lar (-sonsuz, +sonsuz) değer alabilir, biz renge çeviriyoruz.
-                    instance_features_color = torch.sigmoid(gaussians._instance_features)
                     
-                    # override_color doğrudan bu 3 kanallı tensörü alır
-                    instance_render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt, override_color=instance_features_color)
-                    pred_instance_map = instance_render_pkg["render"] # Çıktı: [3, H, W]
+                    # 1. ÖZELLİK RENDER (3 Kanal)
+                    # Matris yok! Özellikleri direkt sigmoid ile 0-1 arasına sıkıştırıp renk gibi çiziyoruz.
+                    feats = torch.sigmoid(gaussians._instance_features)
                     
-                    # 2. GT Maskeyi Hazırla
+                    instance_render_pkg = render(viewpoint_cam, gaussians, pipe, background, opt, override_color=feats)
+                    pred_map = instance_render_pkg["render"] # [3, H, W]
+
+                    # Feature map'i piksel bazında L2 normalize et (Vektör boyu 1 olsun)
+                    pred_map = torch.nn.functional.normalize(pred_map, dim=0, p=2)
+                    
+                    # 2. GT MASKE HAZIRLIĞI
                     gt_mask = viewpoint_cam.gt_mask.long()
                     
-                    # Boyut eşitleme
-                    if gt_mask.shape != pred_instance_map.shape[1:]:
+                    # Boyut uyuşmazlığı varsa düzelt (Rounding hataları için)
+                    if gt_mask.shape != pred_map.shape[1:]:
                          gt_mask = torch.nn.functional.interpolate(
                             gt_mask.unsqueeze(0).unsqueeze(0).float(), 
-                            size=pred_instance_map.shape[1:], 
+                            size=pred_map.shape[1:], 
                             mode="nearest"
                         ).long().squeeze()
 
-                    # 3. Valid Mask (Bilinmeyeni Yoksay)
-                    valid_pixels = (gt_mask > 0)
-
-                    if valid_pixels.sum() > 0:
-                        # 4. GT ID -> HEDEF RENK DÖNÜŞÜMÜ (Hashing)
-                        # Her ID'yi benzersiz bir renge çeviriyoruz.
-                        # Bu sayılar rastgele asal sayılardır, çakışmayı önler.
-                        # (Kullanıcı uyarısı: Parantezler önemli)
-                        r = ((gt_mask * 153245) % 255) / 255.0
-                        g = ((gt_mask * 654321) % 255) / 255.0
-                        b = ((gt_mask * 987654) % 255) / 255.0
+                    # 3. CONTRASTIVE SAMPLING (Akıllı Örnekleme)
+                    # Tüm resme bakmak çok yavaş olur. Rastgele 4096 piksel ve komşularını seçiyoruz.
+                    
+                    H, W = gt_mask.shape
+                    num_samples = 4096
+                    
+                    # Rastgele merkez koordinatları seç
+                    coords_y = torch.randint(0, H, (num_samples,), device="cuda")
+                    coords_x = torch.randint(0, W, (num_samples,), device="cuda")
+                    
+                    # Rastgele komşu ofsetleri (-5 ile +5 piksel arası)
+                    offsets_y = torch.randint(-5, 6, (num_samples,), device="cuda")
+                    offsets_x = torch.randint(-5, 6, (num_samples,), device="cuda")
+                    
+                    # Komşu koordinatları (Sınır dışına taşmasın diye clamp)
+                    neigh_y = torch.clamp(coords_y + offsets_y, 0, H-1)
+                    neigh_x = torch.clamp(coords_x + offsets_x, 0, W-1)
+                    
+                    # 4. DEĞERLERİ TOPLA
+                    # Render edilen featurelar (Transposed: [N, 3])
+                    f_center = pred_map[:, coords_y, coords_x].T
+                    f_neigh = pred_map[:, neigh_y, neigh_x].T
+                    
+                    # GT Maske ID'leri
+                    id_center = gt_mask[coords_y, coords_x]
+                    id_neigh = gt_mask[neigh_y, neigh_x]
+                    
+                    # 5. SEMANTIC MANTIK KURGUSU (Logic Gates)
+                    
+                    # Kural 1: En az biri "Bilinen Nesne" (ID > 0) olmalı.
+                    # İkisi de 0 (Siyah) ise orası "Bilinmeyen vs Bilinmeyen"dir, dokunma.
+                    valid_pair_mask = (id_center > 0) | (id_neigh > 0)
+                    
+                    if valid_pair_mask.sum() > 0:
+                        # Sadece geçerli çiftleri al
+                        f1 = f_center[valid_pair_mask]
+                        f2 = f_neigh[valid_pair_mask]
+                        id1 = id_center[valid_pair_mask]
+                        id2 = id_neigh[valid_pair_mask]
                         
-                        gt_color_map = torch.stack([r, g, b], dim=0).float() # [3, H, W]
-
-                        # 5. Loss Hesabı (Sadece geçerli piksellerde)
-                        valid_mask_3ch = valid_pixels.unsqueeze(0).repeat(3, 1, 1)
+                        # Mesafe (Euclidean)
+                        dist = torch.norm(f1 - f2, dim=1)
                         
-                        masked_pred = pred_instance_map[valid_mask_3ch]
-                        masked_gt = gt_color_map[valid_mask_3ch]
+                        # DURUM A: PULL (Çekme)
+                        # İkisi de AYNI nesne ise ve ikisi de BİLİNEN ise.
+                        # (id1 == id2) AND (id1 > 0)
+                        mask_pull = (id1 == id2) & (id1 > 0)
                         
-                        # L1 Loss (Renk Farkı = Kimlik Farkı)
-                        semantic_loss = l1_loss(masked_pred, masked_gt)
+                        # DURUM B: PUSH (İtme / Ayrıştırma)
+                        # ID'leri FARKLI ise. (Biri 0 olsa bile farklıdır, ayrışmalıdır).
+                        mask_push = (id1 != id2)
                         
-                        # 6. Scale-Aware Penalty
+                        loss_pull = 0.0
+                        loss_push = 0.0
+                        
+                        # Aynı olanların feature'larını birbirine benzet (Mesafe 0 olsun)
+                        if mask_pull.sum() > 0:
+                            loss_pull = (dist[mask_pull] ** 2).mean()
+                            
+                        # Farklı olanların feature'larını uzaklaştır (En az 'margin' kadar olsun)
+                        if mask_push.sum() > 0:
+                            # Hinge Loss: Sadece margin'den yakınsa ceza ver
+                            loss_push = (torch.relu(contrastive_margin - dist[mask_push]) ** 2).mean()
+                        
+                        contrastive_loss = loss_pull + loss_push
+                        
+                        # 6. SCALE-AWARE REGULARIZATION (Büyüklük Cezası)
+                        # Ekranda büyük yer kaplayan Gaussian'lara bak
                         radii = instance_render_pkg["radii"]
-                        visibility_filter = instance_render_pkg["visibility_filter"]
-                        visible_radii = radii[visibility_filter]
+                        vis_filter = instance_render_pkg["visibility_filter"]
+                        visible_radii = radii[vis_filter]
                         
                         scale_penalty = 0.0
                         if visible_radii.numel() > 0:
-                            scale_penalty = torch.mean(torch.relu(visible_radii - 0.5))
+                            # Ekranda 2 pikselden büyük olanların büyüklüğü
+                            scale_penalty = torch.mean(torch.relu(visible_radii - 2.0))
                         
-                        final_sem_loss = semantic_loss + (semantic_loss * scale_penalty * lambda_scale)
+                        # 7. NİHAİ LOSS
+                        # Anlamsal hata varsa ceza ver + Eğer Gaussianlar büyükse KATMERLİ ceza ver.
+                        # Bu çarpım, büyük ve kararsız Gaussian'ların bölünmesini tetikler.
+                        final_sem_loss = contrastive_loss + (contrastive_loss * scale_penalty * lambda_scale)
+                        
                         loss += lambda_sem * final_sem_loss
                         
-                        # Log
+                        # Loglama (İsteğe bağlı)
                         if iteration % 500 == 0:
-                            print(f"Iter {iteration} | RGB: {Ll1.item():.4f} | Sem: {semantic_loss.item():.4f} | Scale: {scale_penalty:.4f}")
+                            print(f"Iter {iteration} | RGB: {Ll1.item():.4f} | Cont: {contrastive_loss.item():.4f} | Scale: {scale_penalty:.4f}")
 
             loss.backward()
         iter_end.record()
@@ -372,6 +454,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
+        # Görselleri kaydetmek için klasör oluştur
+        renders_dir = os.path.join(scene.model_path, "test_renders")
+        os.makedirs(renders_dir, exist_ok=True)
+
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
@@ -379,6 +465,23 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    
+                    # Görseli Diske Kaydet (PNG)
+                    # Sadece ilk 5 kareyi kaydet (çok yer kaplamasın diye) veya hepsini
+                    if idx < 5: 
+                         # Tensor to Numpy [H, W, 3] (0-255 uint8)
+                        img_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        gt_np = (gt_image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        
+                        # Yan yana birleştir (Prediction | Ground Truth)
+                        combined = np.hstack([img_np, gt_np])
+                        
+                        # RGB -> BGR (OpenCV için)
+                        combined = cv2.cvtColor(combined, cv2.COLOR_RGB2BGR)
+                        
+                        save_name = f"{config['name']}_iter{iteration:05d}_{viewpoint.image_name}.png"
+                        cv2.imwrite(os.path.join(renders_dir, save_name), combined)
+
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
