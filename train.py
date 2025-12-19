@@ -8,11 +8,14 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+from utils.consistency_utils import NeighborSearch, warp_consistency_check
+import random
 import lpips
 import os
 import cv2
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim, cos_loss
 from gaussian_renderer import render, network_gui
@@ -65,6 +68,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    # --- YENİ EKLENTİ: KOMŞU BULUCU ---
+    train_cameras = scene.getTrainCameras()
+    neighbor_searcher = NeighborSearch(train_cameras)
+    print(f"Neighbor search initialized with {len(train_cameras)} cameras.")
+    # ----------------------------------
 
     if opt.include_feature:
         if not checkpoint:
@@ -196,6 +205,83 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss = rgb_loss + (opt.lambda_lpips * lpips_val)
             else:
                 loss = rgb_loss
+
+            # -------------------------------------------------------------------
+            # [YENİ] SELF-SUPERVISED GEOMETRIC CONSISTENCY (WARPING)
+            # -------------------------------------------------------------------
+            consistency_loss = 0.0
+            
+            # Loss'u iterasyon 3000'den sonra devreye al
+            if opt.lambda_consistency > 0 and iteration > 3000 and iteration % 2 == 0:
+                try:
+                    # 1. Komşu Seç
+                    cam_idx = train_cameras.index(viewpoint_cam) 
+                    neighbors = neighbor_searcher.get_neighbors(cam_idx, k=3)
+                    
+                    if len(neighbors) > 0:
+                        neighbor_cam = random.choice(neighbors) # Frame B
+                        
+                        # --- DERİNLİK HESAPLAMA KISMI (BURASI DEĞİŞTİ) ---
+                        
+                        # A) Frame A için Derinlik Al (Gradientler AKMALI)
+                        # Yukarıdaki mantığı buraya gömüyoruz:
+                        view_matrix_A = viewpoint_cam.world_view_transform
+                        means3D = gaussians.get_xyz
+                        ones = torch.ones((means3D.shape[0], 1), device="cuda")
+                        points_view_A = torch.cat((means3D, ones), dim=1) @ view_matrix_A
+                        depths_A = points_view_A[:, 2:3]
+                        depth_as_color_A = depths_A.repeat(1, 3)
+                        
+                        # Depth'i render et
+                        depth_pkg_A = render(viewpoint_cam, gaussians, pipe, background, opt, override_color=depth_as_color_A)
+                        depth_A = depth_pkg_A["render"][0:1, :, :] # [1, H, W]
+                        
+                        # B) Frame B için Derinlik Al (Gradient GEREKMEZ - Sadece kontrol için)
+                        with torch.no_grad():
+                            # RGB B
+                            pkg_B = render(neighbor_cam, gaussians, pipe, background, opt)
+                            image_B = pkg_B["render"]
+                            
+                            # Depth B (Occlusion Check için)
+                            view_matrix_B = neighbor_cam.world_view_transform
+                            points_view_B = torch.cat((means3D, ones), dim=1) @ view_matrix_B
+                            depths_B = points_view_B[:, 2:3]
+                            depth_as_color_B = depths_B.repeat(1, 3)
+                            
+                            pkg_B_depth = render(neighbor_cam, gaussians, pipe, background, opt, override_color=depth_as_color_B)
+                            depth_B = pkg_B_depth["render"][0:1, :, :]
+
+                        # -------------------------------------------------
+
+                        # 4. Warping & Loss (OPTIMIZASYONLU: DOWNSAMPLE)
+                        # Bellek tasarrufu için tutarlılık kontrolünü daha düşük çözünürlükte yapıyoruz.
+                        # Görüntü boyutu küçülse de geometri bilgisi korunur.
+                        downsample_factor = 1 # Yarı yarıya küçült (H/2, W/2). Bellek kullanımı ~4 kat azalır.
+                        
+                        # A) Girdileri küçült
+                        img_A_small = F.interpolate(image.unsqueeze(0), scale_factor=1/downsample_factor, mode='bilinear', align_corners=False).squeeze(0)
+                        depth_A_small = F.interpolate(depth_A.unsqueeze(0), scale_factor=1/downsample_factor, mode='bilinear', align_corners=False).squeeze(0)
+                        
+                        img_B_small = F.interpolate(image_B.unsqueeze(0), scale_factor=1/downsample_factor, mode='bilinear', align_corners=False).squeeze(0)
+                        depth_B_small = F.interpolate(depth_B.unsqueeze(0), scale_factor=1/downsample_factor, mode='bilinear', align_corners=False).squeeze(0)
+
+                        cons_loss_val, valid_mask, warped_img = warp_consistency_check(
+                            img_A_small, depth_A_small, viewpoint_cam, neighbor_cam,
+                            img_B_small, depth_B_small
+                        )
+                        
+                        consistency_loss = opt.lambda_consistency * cons_loss_val
+                        
+                        loss += consistency_loss
+                        
+                        if iteration % 500 == 0:
+                            print(f"Iter {iteration} | Consistency Loss: {cons_loss_val.item():.5f} (Valid: {valid_mask.float().mean():.2%}) | Res: 1/{downsample_factor}")
+
+                except Exception as e:
+                    print(f"Consistency check failed: {e}")
+                    pass
+
+            # -------------------------------------------------------------------
             
             # -------------------------------------------------------------------
             # [YENİ] SEMANTIC CONSISTENCY & GEOMETRIC REGULARIZATION
@@ -203,7 +289,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # -------------------------------------------------------------------
             
             # Parametreleri al (Argüman yoksa varsayılanları kullan)
-            lambda_sem = getattr(opt, "lambda_sem", 0.1) 
+            # Parametreleri al (Argüman yoksa varsayılanları kullan)
+            lambda_sem = getattr(opt, "lambda_sem", 0.0) 
             lambda_scale = getattr(opt, "lambda_scale", 0.05) 
             contrastive_margin = 0.5  # Farklı nesneler feature uzayında en az bu kadar uzak olmalı
 
@@ -454,7 +541,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
-        # Görselleri kaydetmek için klasör oluştur
         renders_dir = os.path.join(scene.model_path, "test_renders")
         os.makedirs(renders_dir, exist_ok=True)
 
@@ -463,34 +549,61 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
+                    
+                    # 1. RGB RENDER
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     
-                    # Görseli Diske Kaydet (PNG)
-                    # Sadece ilk 5 kareyi kaydet (çok yer kaplamasın diye) veya hepsini
+                    # 2. DEPTH RENDER (Hile ile)
+                    # Gaussian merkezlerini transform et ve Z değerini al
+                    view_matrix = viewpoint.world_view_transform
+                    means3D = scene.gaussians.get_xyz
+                    ones = torch.ones((means3D.shape[0], 1), device="cuda")
+                    points_view = torch.cat((means3D, ones), dim=1) @ view_matrix
+                    depths = points_view[:, 2:3]
+                    
+                    # Derinliği renk gibi ver
+                    depth_as_color = depths.repeat(1, 3)
+                    depth_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs, override_color=depth_as_color)
+                    pred_depth = depth_pkg["render"][0:1, :, :] # [1, H, W]
+
+                    # --- GÖRSEL KAYDETME ---
                     if idx < 5: 
-                         # Tensor to Numpy [H, W, 3] (0-255 uint8)
+                        # RGB Hazırla
                         img_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                         gt_np = (gt_image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                         
-                        # Yan yana birleştir (Prediction | Ground Truth)
-                        combined = np.hstack([img_np, gt_np])
+                        # Depth Hazırla (Görselleştirme için Normalize Et)
+                        depth_np = pred_depth.squeeze().cpu().numpy()
+                        # Min-Max Normalizasyon (0-255 arası)
+                        d_min, d_max = depth_np.min(), depth_np.max()
+                        if (d_max - d_min) > 0:
+                            depth_norm = (depth_np - d_min) / (d_max - d_min)
+                        else:
+                            depth_norm = depth_np
                         
-                        # RGB -> BGR (OpenCV için)
-                        combined = cv2.cvtColor(combined, cv2.COLOR_RGB2BGR)
+                        depth_uint8 = (depth_norm * 255).astype(np.uint8)
+                        # Renkli Haritaya Çevir (MAGMA veya INFERNO güzel durur)
+                        depth_colormap = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
                         
-                        save_name = f"{config['name']}_iter{iteration:05d}_{viewpoint.image_name}.png"
+                        # Yan yana birleştir: RGB Prediction | RGB GT | Depth Prediction
+                        # Depth [H,W,3] BGR formatında gelir cv2'den
+                        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                        gt_bgr = cv2.cvtColor(gt_np, cv2.COLOR_RGB2BGR)
+                        
+                        combined = np.hstack([img_bgr, gt_bgr, depth_colormap])
+                        
+                        save_name = f"{config['name']}_iter{iteration:05d}_{viewpoint.image_name}_RGB_GT_Depth.png"
                         cv2.imwrite(os.path.join(renders_dir, save_name), combined)
 
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    # Metrik Hesapları
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
+                
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)

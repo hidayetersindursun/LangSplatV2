@@ -10,7 +10,9 @@ from arguments import ModelParams, PipelineParams
 import sys
 from types import SimpleNamespace as Namespace
 import torch.nn.functional as F
-from utils.loss_utils import l1_loss 
+from utils.loss_utils import l1_loss, ssim
+from utils.image_utils import psnr
+from lpipsPyTorch import LPIPS 
 
 # --- YARDIMCI FONKSİYONLAR ---
 
@@ -58,6 +60,7 @@ def calculate_miou(pred_ids, gt_mask, num_classes):
         
     return sum(iou_list) / len(iou_list) if iou_list else 0.0
 
+@torch.no_grad()
 def evaluate(dataset_args, pipeline_args, full_args):
     dataset_args.eval = True
     gaussians = GaussianModel(dataset_args.sh_degree)
@@ -93,11 +96,18 @@ def evaluate(dataset_args, pipeline_args, full_args):
         gaussians._instance_features = torch.nn.Parameter(instance_features.requires_grad_(False))
         is_3_channel = True # Rastgele olduğu için fark etmez
 
+    # LPIPS Modeli (VGG - Algısal Benzerlik için)
+    lpips_model = LPIPS(net_type='vgg').to("cuda")
+    lpips_model.eval()
+
     test_cameras = scene.getTestCameras()
     if len(test_cameras) == 0: test_cameras = scene.getTrainCameras()
     
     total_miou = 0.0
     total_acc = 0.0
+    total_psnr = 0.0
+    total_ssim = 0.0
+    total_lpips = 0.0
     count = 0
     
     mask_root = os.path.join(full_args.source_path, "masks_sam2")
@@ -128,9 +138,24 @@ def evaluate(dataset_args, pipeline_args, full_args):
             # Baseline: Matris çarpımı
             render_input = gaussians._instance_features @ global_projection_matrix
         
-        # Render
+        # Render (Semantic)
         render_pkg = render(view, gaussians, pipeline_args, background, opt=full_args, scaling_modifier=1.0, override_color=render_input)
         rendered_map = render_pkg["render"] # [3, H, W]
+
+        # --- RGB METRICS (PSNR, SSIM, LPIPS) ---
+        # Standart RGB render (Override color yok)
+        rgb_render_pkg = render(view, gaussians, pipeline_args, background, opt=full_args, scaling_modifier=1.0)
+        image = rgb_render_pkg["render"]
+        gt_image = view.original_image.cuda()
+
+        # Metrics Calculation
+        psnr_val = psnr(image, gt_image).mean().double()
+        ssim_val = ssim(image, gt_image).mean().double()
+        lpips_val = lpips_model(image.unsqueeze(0), gt_image.unsqueeze(0)).mean().double()
+
+        total_psnr += psnr_val
+        total_ssim += ssim_val
+        total_lpips += lpips_val
         
         # --- DECODING (Renk -> ID) ---
         # Render edilen (3 kanallı) haritayı tekrar ID'ye çevirmemiz lazım
@@ -166,6 +191,11 @@ def evaluate(dataset_args, pipeline_args, full_args):
         print(f"\n--- SONUÇLAR ({full_args.model_path}) ---")
         print(f"Accuracy: {total_acc / count:.4f}")
         print(f"mIoU:     {total_miou / count:.4f}")
+        print("-" * 20)
+        print(f"PSNR:     {total_psnr / count:.4f}  (Higher is better)")
+        print(f"SSIM:     {total_ssim / count:.4f}  (Higher is better)")
+        print(f"LPIPS:    {total_lpips / count:.4f} (Lower is better)")
+        print("-" * 20)
 
 if __name__ == "__main__":
     parser = ArgumentParser()

@@ -285,13 +285,26 @@ if __name__ == "__main__":
         args.ckpt_paths = [args.custom_model_path] * 3
     else:
         # Default LangSplat structure for our project
-        # Assuming dataset_name is 'araba' and output base is 'araba_final'
+        # Pattern 1: {dataset}_final_{level}_{level} (Araba style)
+        # Pattern 2: {dataset}_0_{level+1} (Waldo style)
+        
+        ckpt_paths = []
+        # Try Araba Style first
         base_name = f"{args.dataset_name}_final"
-        args.ckpt_paths = [
-            os.path.join(args.ckpt_root_path, f"{base_name}_{level}_{level}") 
-            for level in [0, 1, 2]
-        ]
-        print(f"📂 Checkpoint Paths: {args.ckpt_paths}")
+        araba_paths = [os.path.join(args.ckpt_root_path, f"{base_name}_{l}_{l}") for l in [0, 1, 2]]
+        
+        # Try Waldo Style
+        waldo_paths = [os.path.join(args.ckpt_root_path, f"{args.dataset_name}_0_{l}") for l in [1, 2, 3]]
+        
+        if os.path.exists(araba_paths[0]):
+            args.ckpt_paths = araba_paths
+        elif os.path.exists(waldo_paths[0]):
+            args.ckpt_paths = waldo_paths
+        else:
+            # Fallback to Araba style naming even if not exists (for error consistency)
+            args.ckpt_paths = araba_paths
+            
+        print(f"📂 Detected Checkpoint Paths: {args.ckpt_paths}")
     
     renderer = BackendRenderer(model.extract(args), pipeline.extract(args), args)
     renderer.run()

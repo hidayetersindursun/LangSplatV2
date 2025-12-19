@@ -117,13 +117,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
-    # end_time = time.time()
-    # print('render_init_rasterizer程序运行时间为: %s Seconds'%(end_time-start_time))
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-    # They will be excluded from value updates used in the splitting criteria.
+
+    # Try to retrieve depth if rasterizer supports it (this is a placeholder, usually depth is an extra output)
+    # Since we can't change the C++ rasterizer signature easily here, we just set it to None 
+    # unless the user has a modified rasterizer that returns it. 
+    # However, standard practice to get depth is often modifying the rasterizer call. 
+    # If the user *knows* the rasterizer returns more info, we'd handle it. 
+    # But adhering to the user's snippet "rendered_image, radii, depth_map = rasterizer(...)" implies a different signature.
+    # Given the current signature `rendered_image, language_feature_weight_map, radii`, we assume depth IS NOT returned.
+    # We will add "depth": None to the dict so the key exists.
     
     return {"render": rendered_image,
             "language_feature_weight_map": language_feature_weight_map,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
-            "radii": radii}
+            "radii": radii,
+            "depth": None}
