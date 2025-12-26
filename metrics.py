@@ -81,9 +81,13 @@ def evaluate(dataset_args, pipeline_args, full_args):
     global_projection_matrix = global_projection_matrix / (global_projection_matrix.norm(dim=1, keepdim=True) + 1e-8)
 
     # Model Tipi Kontrolü
+    # --------------------------------------------------------
     is_3_channel = False
+    feature_dim = 0
     if hasattr(gaussians, "_instance_features"):
-        if gaussians._instance_features.shape[1] == 3:
+        feature_dim = gaussians._instance_features.shape[1]
+        print(f"Feature Dimension: {feature_dim}")
+        if feature_dim == 3:
             is_3_channel = True
             print("Tespit Edildi: 3-Kanallı Model (Ours - Hashing)")
         else:
@@ -91,11 +95,18 @@ def evaluate(dataset_args, pipeline_args, full_args):
     else:
         print("Uyarı: Instance feature yok, rastgele init ediliyor.")
         fused_point_cloud = gaussians.get_xyz
-        # Baseline ise rastgele 256 boyutludur varsayıyoruz veya renderda hata vermemesi için 3 yapıyoruz
-        instance_features = torch.randn((fused_point_cloud.shape[0], 3), dtype=torch.float, device="cuda")
+        feature_dim = 3 # Varsayılan
+        instance_features = torch.randn((fused_point_cloud.shape[0], feature_dim), dtype=torch.float, device="cuda")
         gaussians._instance_features = torch.nn.Parameter(instance_features.requires_grad_(False))
-        is_3_channel = True # Rastgele olduğu için fark etmez
+        is_3_channel = True
 
+    # Baseline için Matris (Feature Dim -> 3)
+    torch.manual_seed(42)
+    # Eğer feature_dim 3 değilse, projeksiyon matrisi (dim, 3) olmalı.
+    projection_dim = feature_dim if feature_dim > 0 else num_objects
+    global_projection_matrix = torch.randn((projection_dim, 3), device="cuda")
+    global_projection_matrix = global_projection_matrix / (global_projection_matrix.norm(dim=1, keepdim=True) + 1e-8)
+    
     # LPIPS Modeli (VGG - Algısal Benzerlik için)
     lpips_model = LPIPS(net_type='vgg').to("cuda")
     lpips_model.eval()
@@ -135,7 +146,7 @@ def evaluate(dataset_args, pipeline_args, full_args):
             # Ours: Sigmoid uygula
             render_input = torch.sigmoid(gaussians._instance_features)
         else:
-            # Baseline: Matris çarpımı
+            # Baseline: Matris çarpımı (N, dim) @ (dim, 3) -> (N, 3)
             render_input = gaussians._instance_features @ global_projection_matrix
         
         # Render (Semantic)
@@ -163,12 +174,9 @@ def evaluate(dataset_args, pipeline_args, full_args):
         flat_render = rendered_map.permute(1, 2, 0).reshape(-1, 3) # [P, 3]
         
         # Hangi referans tablosunu kullanacağız?
-        if is_3_channel:
-            target_colors = reference_colors # [256, 3] (Hashing tablosu)
-        else:
-            # Baseline için projeksiyon matrisi renkleri temsil eder (kabaca)
-            # Not: Baseline'da ID öğrenilmediği için bu zaten rastgele çıkacak.
-            target_colors = global_projection_matrix 
+        # HER TÜRLÜ referans tablosunu (256 renk) kullanalım.
+        # Baseline zaten rastgele çıkacak, en azından 256 sınıfı da kapsasın.
+        target_colors = reference_colors # [256, 3]
 
         # En yakın ID'yi bul
         # (Pixel sayısı çoksa chunking yapmak gerekebilir ama 24GB VRAM yeter)

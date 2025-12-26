@@ -154,7 +154,7 @@ def warp_consistency_check(image_A, depth_A, view_A, view_B, image_B, depth_B):
     # Fırlattığımız derinlik (depth_proj), orada var olan derinlikten (sampled_depth_B)
     # çok büyükse, demek ki arkada kalmışız.
     # depth_proj ~ sampled_depth_B olmalı.
-    tolerance = 0.1 # 10 cm tolerans (Sahne ölçeğine göre ayarlanmalı!)
+    tolerance = 0.01 # 10 cm tolerans (Sahne ölçeğine göre ayarlanmalı!)
     
     # projected (misafir) < current (ev sahibi) + tolerance
     # (Not: 3DGS depth değerleri bazen gürültülüdür, toleransı iyi ayarla)
